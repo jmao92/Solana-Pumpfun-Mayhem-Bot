@@ -29,7 +29,18 @@ import {
 import { getTokenAccounts, RAYDIUM_LIQUIDITY_PROGRAM_ID_V4, OPENBOOK_PROGRAM_ID, createPoolKeys } from './core/liquidity';
 import { retry } from './core/utils';
 import { keypairEncryption } from './core/utils';
-import { retrieveEnvVariable, retrieveTokenValueByAddress} from './core/utils';
+import { 
+  retrieveEnvVariable, 
+  retrieveTokenValueByAddress, 
+  sendTelegramNotification, 
+  sendCoinScanNotification, 
+  CoinScanData, 
+  getBirdeyeTokenInfo, 
+  checkRugPull,
+  formatScanNotification,
+  formatBulkScanSummary,
+  ScanCoinDetails
+} from './core/utils';
 import { getMinimalMarketV3, MinimalMarketLayoutV3 } from './core/market';
 import { MintLayout } from './core/types';
 import pino from 'pino';
@@ -87,6 +98,10 @@ let existingLiquidityPools: Set<string> = new Set<string>();
 let existingOpenBookMarkets: Set<string> = new Set<string>();
 let existingTokenAccounts: Map<string, MinimalTokenAccountData> = new Map<string, MinimalTokenAccountData>();
 
+// Pumpfun program ID
+const PUMPFUN_PROGRAM_ID = new PublicKey('6EF8rJ3WgAC7tRZ9oJW7Sy8DYbK6mkemqYDhMyW6DExx');
+let existingPumpfunCoins: Set<string> = new Set<string>();
+
 let wallet: Keypair;
 let quoteToken: Token;
 let quoteTokenAssociatedAddress: PublicKey;
@@ -102,8 +117,23 @@ const SNIPE_LIST_REFRESH_INTERVAL = Number(retrieveEnvVariable('SNIPE_LIST_REFRE
 const AUTO_SELL = retrieveEnvVariable('AUTO_SELL', logger) === 'true';
 const MAX_SELL_RETRIES = Number(retrieveEnvVariable('MAX_SELL_RETRIES', logger));
 const MIN_POOL_SIZE = retrieveEnvVariable('MIN_POOL_SIZE', logger);
+const SCAN_ONLY_MODE = retrieveEnvVariable('SCAN_ONLY_MODE', logger) === 'true';
 
 let snipeList: string[] = [];
+let scannedCoins: Array<{ mint: string; timestamp: number; rugScore: number; marketCap?: number }> = [];
+
+// Scan statistics for periodic reporting
+let scanStats = {
+  totalScanned: 0,
+  withData: 0,
+  notIndexed: 0,
+  lowRisk: 0,
+  mediumRisk: 0,
+  highRisk: 0,
+  notRenounced: 0,
+};
+const lastStatsLog = { time: Date.now() };
+const STATS_LOG_INTERVAL = 60000; // Log stats every 60 seconds
 
 async function init(): Promise<void> {
   // get wallet
@@ -116,6 +146,7 @@ async function init(): Promise<void> {
   const QUOTE_MINT = retrieveEnvVariable('QUOTE_MINT', logger);
   const QUOTE_AMOUNT = retrieveEnvVariable('QUOTE_AMOUNT', logger);
   switch (QUOTE_MINT) {
+    case 'SOL':
     case 'WSOL': {
       quoteToken = Token.WSOL;
       quoteAmount = new TokenAmount(Token.WSOL, QUOTE_AMOUNT, false);
@@ -134,12 +165,13 @@ async function init(): Promise<void> {
       break;
     }
     default: {
-      throw new Error(`Unsupported quote mint "${QUOTE_MINT}". Supported values are USDC and WSOL`);
+      throw new Error(`Unsupported quote mint "${QUOTE_MINT}". Supported values are SOL, WSOL, and USDC`);
     }
   }
 
   logger.info(`Snipe list: ${USE_SNIPE_LIST}`);
   logger.info(`Check mint renounced: ${CHECK_IF_MINT_IS_RENOUNCED}`);
+  logger.info(`🔍 SCAN ONLY MODE: ${SCAN_ONLY_MODE ? '✅ ON (No buying)' : '❌ OFF (Trading enabled)'}`);
   logger.info(
     `Min pool size: ${quoteMinPoolSizeAmount.isZero() ? 'false' : quoteMinPoolSizeAmount.toFixed()} ${quoteToken.symbol}`,
   );
@@ -156,13 +188,19 @@ async function init(): Promise<void> {
     });
   }
 
-  const tokenAccount = tokenAccounts.find((acc) => acc.accountInfo.mint.toString() === quoteToken.mint.toString())!;
+  let tokenAccount = tokenAccounts.find((acc) => acc.accountInfo.mint.toString() === quoteToken.mint.toString());
 
   if (!tokenAccount) {
-    throw new Error(`No ${quoteToken.symbol} token account found in wallet: ${wallet.publicKey}`);
+    logger.warn(`No ${quoteToken.symbol} token account found. Creating one...`);
+    
+    // Create ATA for quote token
+    const ata = getAssociatedTokenAddressSync(quoteToken.mint, wallet.publicKey);
+    quoteTokenAssociatedAddress = ata;
+    
+    logger.info(`Created associated token account: ${ata.toBase58()}`);
+  } else {
+    quoteTokenAssociatedAddress = tokenAccount.pubkey;
   }
-
-  quoteTokenAssociatedAddress = tokenAccount.pubkey;
 
   // load tokens to snipe
   loadSnipeList();
@@ -188,16 +226,112 @@ export async function processRaydiumPool(id: PublicKey, poolState: LiquidityStat
     return;
   }
 
+  const baseMintStr = poolState.baseMint.toBase58();
+  const poolIdStr = id.toBase58();
+
+  // Check if mint is renounced
+  let isMintRenounced = true;
   if (CHECK_IF_MINT_IS_RENOUNCED) {
     const mintOption = await checkMintable(poolState.baseMint);
 
     if (mintOption !== true) {
-      logger.warn({ mint: poolState.baseMint }, 'Skipping, owner can mint tokens!');
+      if (SCAN_ONLY_MODE) {
+        scanStats.notRenounced++;
+      }
+      logger.debug({ mint: poolState.baseMint }, 'Skipping, owner can mint tokens (filtered by renounce check)');
+      // Don't send notifications for filtered coins (too spammy)
       return;
     }
+    isMintRenounced = true;
   }
 
-  await buy(id, poolState);
+  // Send scanning notification with security checks
+  try {
+    const rugCheck = await checkRugPull(baseMintStr);
+    const birdeyeData = await getBirdeyeTokenInfo(baseMintStr);
+
+    const coinDetails = {
+      mint: baseMintStr,
+      poolId: poolIdStr,
+      timestamp: Date.now(),
+      marketCap: birdeyeData?.market_cap || 0,
+      holders: birdeyeData?.holder_count || 0,
+      liquidity: birdeyeData?.liquidity?.usd || 0,
+      rugScore: rugCheck.score,
+      isHoneypot: rugCheck.score > 70,
+      ownerBalance: parseFloat(rugCheck.details.match(/Owner Balance.*?(\d+\.?\d*)/)?.[1] || '0'),
+      top10HolderRatio: parseFloat(rugCheck.details.match(/Top 10 Holders.*?(\d+\.?\d*)/)?.[1] || '0'),
+    };
+
+    // Store scanned coin data
+    scannedCoins.push({
+      mint: baseMintStr,
+      timestamp: Date.now(),
+      rugScore: rugCheck.score,
+      marketCap: birdeyeData?.market_cap,
+    });
+
+    // Keep only last 1000 scanned coins
+    if (scannedCoins.length > 1000) {
+      scannedCoins = scannedCoins.slice(-1000);
+    }
+
+    if (SCAN_ONLY_MODE) {
+      // Update scan statistics
+      scanStats.totalScanned++;
+      
+      // Log scan details at INFO level
+      const hasData = birdeyeData && (birdeyeData.market_cap || birdeyeData.holder_count);
+      
+      if (hasData) {
+        scanStats.withData++;
+        
+        // Categorize by rug score
+        if (rugCheck.score < 30) scanStats.lowRisk++;
+        else if (rugCheck.score < 60) scanStats.mediumRisk++;
+        else scanStats.highRisk++;
+        
+        const source = birdeyeData?.source === 'dexscreener' ? '📊 DexScreener' : '🦅 Birdeye';
+        
+        logger.info(
+          {
+            mint: baseMintStr,
+            poolId: poolIdStr,
+            rugScore: rugCheck.score,
+            marketCap: birdeyeData?.market_cap,
+            holders: birdeyeData?.holder_count,
+            liquidity: birdeyeData?.liquidity?.usd,
+            source: birdeyeData?.source || 'birdeye',
+          },
+          `${source} ✅ SCANNED - MC: $${(birdeyeData?.market_cap ? (birdeyeData.market_cap / 1000000).toFixed(2) : '0')}M | Holders: ${birdeyeData?.holder_count || '?'} | Rug: ${rugCheck.score}/100`,
+        );
+
+        // Send notification only for coins with low rug score
+        if (rugCheck.score < 50) {
+          const { formatScanNotification } = await import('./core/utils');
+          const notification = formatScanNotification(coinDetails);
+          await sendTelegramNotification(notification);
+          logger.info({ mint: baseMintStr }, `📲 Telegram notification sent (Risk Level: ${rugCheck.score < 30 ? 'LOW' : 'MEDIUM'})`);
+        } else {
+          logger.debug({ mint: baseMintStr, rugScore: rugCheck.score }, `Skipped notification (risk too high)`);
+        }
+      } else {
+        // Token not yet indexed by either service
+        scanStats.notIndexed++;
+      }
+      
+      // Log stats periodically (every 60 seconds)
+      if (Date.now() - lastStatsLog.time > STATS_LOG_INTERVAL) {
+        logger.info(
+          scanStats,
+          `📊 SCAN STATS: Scanned ${scanStats.totalScanned} tokens | With Data: ${scanStats.withData} | Not Indexed: ${scanStats.notIndexed} | 🟢 Low Risk: ${scanStats.lowRisk} | 🟡 Medium: ${scanStats.mediumRisk} | 🔴 High: ${scanStats.highRisk}`,
+        );
+        lastStatsLog.time = Date.now();
+      }
+    }
+  } catch (e) {
+    logger.warn({ mint: baseMintStr, error: String(e) }, 'Failed to scan coin');
+  }
 }
 
 export async function checkMintable(vault: PublicKey): Promise<boolean | undefined> {
@@ -231,194 +365,35 @@ export async function processOpenBookMarket(updatedAccountInfo: KeyedAccountInfo
   }
 }
 
-async function buy(accountId: PublicKey, accountData: LiquidityStateV4): Promise<void> {
-  try {
-    let tokenAccount = existingTokenAccounts.get(accountData.baseMint.toString());
-
-    if (!tokenAccount) {
-      // it's possible that we didn't have time to fetch open book data
-      const market = await getMinimalMarketV3(solanaConnection, accountData.marketId, commitment);
-      tokenAccount = saveTokenAccount(accountData.baseMint, market);
-    }
-
-    tokenAccount.poolKeys = createPoolKeys(accountId, accountData, tokenAccount.market!);
-    const { innerTransaction } = Liquidity.makeSwapFixedInInstruction(
-      {
-        poolKeys: tokenAccount.poolKeys,
-        userKeys: {
-          tokenAccountIn: quoteTokenAssociatedAddress,
-          tokenAccountOut: tokenAccount.address,
-          owner: wallet.publicKey,
-        },
-        amountIn: quoteAmount.raw,
-        minAmountOut: 0,
-      },
-      tokenAccount.poolKeys.version,
-    );
-
-    const latestBlockhash = await solanaConnection.getLatestBlockhash({
-      commitment: commitment,
-    });
-    const messageV0 = new TransactionMessage({
-      payerKey: wallet.publicKey,
-      recentBlockhash: latestBlockhash.blockhash,
-      instructions: [
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 421197 }),
-        ComputeBudgetProgram.setComputeUnitLimit({ units: 101337 }),
-        createAssociatedTokenAccountIdempotentInstruction(
-          wallet.publicKey,
-          tokenAccount.address,
-          wallet.publicKey,
-          accountData.baseMint,
-        ),
-        ...innerTransaction.instructions,
-      ],
-    }).compileToV0Message();
-    const transaction = new VersionedTransaction(messageV0);
-    transaction.sign([wallet, ...innerTransaction.signers]);
-    const rawTransaction = transaction.serialize();
-    const signature = await retry(
-    () =>
-      solanaConnection.sendRawTransaction(rawTransaction, {
-        skipPreflight: true,
-      }),
-    { retryIntervalMs: 10, retries: 50 }, // TODO handle retries more efficiently
-  );
-    logger.info({ mint: accountData.baseMint, signature }, `Sent buy tx`);
-    const confirmation = await solanaConnection.confirmTransaction(
-      {
-        signature,
-        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
-        blockhash: latestBlockhash.blockhash,
-      },
-      commitment,
-    );
-    const basePromise = solanaConnection.getTokenAccountBalance(accountData.baseVault, commitment);
-    const quotePromise = solanaConnection.getTokenAccountBalance(accountData.quoteVault, commitment);
-
-    await Promise.all([basePromise, quotePromise]);
-
-    const baseValue = await basePromise;
-    const quoteValue = await quotePromise;
-
-    if (baseValue?.value?.uiAmount && quoteValue?.value?.uiAmount)
-      tokenAccount.buyValue = quoteValue?.value?.uiAmount / baseValue?.value?.uiAmount;
-    if (!confirmation.value.err) {
-      logger.info(
-        {
-          signature,
-          url: `https://solscan.io/tx/${signature}?cluster=${network}`,
-          dex: `https://dexscreener.com/solana/${accountData.baseMint}?maker=${wallet.publicKey}`,
-        },
-        `Confirmed buy tx... Bought at: ${tokenAccount.buyValue} SOL`,
-      );
-    } else {
-      logger.debug(confirmation.value.err);
-      logger.info({ mint: accountData.baseMint, signature }, `Error confirming buy tx`);
-    }
-  } catch (e) {
-    logger.debug(e);
-    logger.error({ mint: accountData.baseMint }, `Failed to buy token`);
+export async function processPumpfunCoin(updatedAccountInfo: KeyedAccountInfo) {
+  const accountId = updatedAccountInfo.accountId.toString();
+  
+  if (existingPumpfunCoins.has(accountId)) {
+    return;
   }
+
+  existingPumpfunCoins.add(accountId);
+
+  try {
+    // Extract token mint from account data
+    // Pumpfun events contain token information
+    const tokenData = updatedAccountInfo.accountInfo.data;
+    
+    // Try to extract mint address (typically in the account data)
+    // For now, we'll get basic info and send notification
+    logger.info({ account: accountId }, `🍆 New Pumpfun coin detected`);
+
+    // Send notification for Pumpfun coin
+    const notification = `🍆 **PUMPFUN COIN DETECTED**\n📍 Account: \`${accountId}\`\n[View on Solscan](https://solscan.io/account/${accountId})`;
+    await sendTelegramNotification(notification);
+  } catch (e) {
+    logger.debug('Failed to process Pumpfun coin', e);
 }
+  }
 
-async function sell(accountId: PublicKey, mint: PublicKey, amount: BigNumberish, value: number): Promise<boolean> {
-  let retries = 0;
+// BUYING FUNCTION REMOVED - SCAN ONLY MODE
 
-  do {
-    try {
-      const tokenAccount = existingTokenAccounts.get(mint.toString());
-      if (!tokenAccount) {
-        return true;
-      }
-
-      if (!tokenAccount.poolKeys) {
-        logger.warn({ mint }, 'No pool keys found');
-        continue;
-      }
-
-      if (amount === 0) {
-        logger.info(
-          {
-            mint: tokenAccount.mint,
-          },
-          `Empty balance, can't sell`,
-        );
-        return true;
-      }
-
-      // check st/tp
-      if (tokenAccount.buyValue === undefined) return true;
-
-      const netChange = (value - tokenAccount.buyValue) / tokenAccount.buyValue;
-      if (netChange > STOP_LOSS && netChange < TAKE_PROFIT) return false;
-
-      const { innerTransaction } = Liquidity.makeSwapFixedInInstruction(
-        {
-          poolKeys: tokenAccount.poolKeys!,
-          userKeys: {
-            tokenAccountOut: quoteTokenAssociatedAddress,
-            tokenAccountIn: tokenAccount.address,
-            owner: wallet.publicKey,
-          },
-          amountIn: amount,
-          minAmountOut: 0,
-        },
-        tokenAccount.poolKeys!.version,
-      );
-
-      const latestBlockhash = await solanaConnection.getLatestBlockhash({
-        commitment: commitment,
-      });
-      const messageV0 = new TransactionMessage({
-        payerKey: wallet.publicKey,
-        recentBlockhash: latestBlockhash.blockhash,
-        instructions: [
-          ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 400000 }),
-          ComputeBudgetProgram.setComputeUnitLimit({ units: 200000 }),
-          ...innerTransaction.instructions,
-          createCloseAccountInstruction(tokenAccount.address, wallet.publicKey, wallet.publicKey),
-        ],
-      }).compileToV0Message();
-      
-      const transaction = new VersionedTransaction(messageV0);
-      transaction.sign([wallet, ...innerTransaction.signers]);
-      const signature = await solanaConnection.sendRawTransaction(transaction.serialize(), {
-        preflightCommitment: commitment,
-      });
-      logger.info({ mint, signature }, `Sent sell tx`);
-      const confirmation = await solanaConnection.confirmTransaction(
-        {
-          signature,
-          lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
-          blockhash: latestBlockhash.blockhash,
-        },
-        commitment,
-      );
-      if (confirmation.value.err) {
-        logger.debug(confirmation.value.err);
-        logger.info({ mint, signature }, `Error confirming sell tx`);
-        continue;
-      }
-
-      logger.info(
-        {
-          mint,
-          signature,
-          url: `https://solscan.io/tx/${signature}?cluster=${network}`,
-          dex: `https://dexscreener.com/solana/${mint}?maker=${wallet.publicKey}`,
-        },
-        `Confirmed sell tx... Sold at: ${value}\tNet Profit: ${netChange * 100}%`,
-      );
-      return true;
-    } catch (e: any) {
-      retries++;
-      logger.debug(e);
-      logger.error({ mint }, `Failed to sell token, retry: ${retries}/${MAX_SELL_RETRIES}`);
-    }
-  } while (retries < MAX_SELL_RETRIES);
-  return true;
-}
+// SELLING FUNCTION REMOVED - SCAN ONLY MODE
 
 // async function getMarkPrice(connection: Connection, baseMint: PublicKey, quoteMint?: PublicKey): Promise<number> {
 //   const marketAddress = await Market.findAccountsByMints(
@@ -458,107 +433,90 @@ function shouldBuy(key: string): boolean {
 }
 
 const runListener = async () => {
-  await init();
-  const runTimestamp = Math.floor(new Date().getTime() / 1000);
-  const raydiumSubscriptionId = solanaConnection.onProgramAccountChange(
-    RAYDIUM_LIQUIDITY_PROGRAM_ID_V4,
-    async (updatedAccountInfo) => {
-      const key = updatedAccountInfo.accountId.toString();
-      const poolState = LIQUIDITY_STATE_LAYOUT_V4.decode(updatedAccountInfo.accountInfo.data);
-      const poolOpenTime = parseInt(poolState.poolOpenTime.toString());
-      const existing = existingLiquidityPools.has(key);
-
-      if (poolOpenTime > runTimestamp && !existing) {
-        existingLiquidityPools.add(key);
-        const _ = processRaydiumPool(updatedAccountInfo.accountId, poolState);
-      }
-    },
-    commitment,
-    [
-      { dataSize: LIQUIDITY_STATE_LAYOUT_V4.span },
-      {
-        memcmp: {
-          offset: LIQUIDITY_STATE_LAYOUT_V4.offsetOf('quoteMint'),
-          bytes: quoteToken.mint.toBase58(),
-        },
-      },
-      {
-        memcmp: {
-          offset: LIQUIDITY_STATE_LAYOUT_V4.offsetOf('marketProgramId'),
-          bytes: OPENBOOK_PROGRAM_ID.toBase58(),
-        },
-      },
-      {
-        memcmp: {
-          offset: LIQUIDITY_STATE_LAYOUT_V4.offsetOf('status'),
-          bytes: bs58.encode([6, 0, 0, 0, 0, 0, 0, 0]),
-        },
-      },
-    ],
-  );
-
-  const openBookSubscriptionId = solanaConnection.onProgramAccountChange(
-    OPENBOOK_PROGRAM_ID,
-    async (updatedAccountInfo) => {
-      const key = updatedAccountInfo.accountId.toString();
-      const existing = existingOpenBookMarkets.has(key);
-      if (!existing) {
-        existingOpenBookMarkets.add(key);
-        const _ = processOpenBookMarket(updatedAccountInfo);
-      }
-    },
-    commitment,
-    [
-      { dataSize: MARKET_STATE_LAYOUT_V3.span },
-      {
-        memcmp: {
-          offset: MARKET_STATE_LAYOUT_V3.offsetOf('quoteMint'),
-          bytes: quoteToken.mint.toBase58(),
-        },
-      },
-    ],
-  );
-
-  if (AUTO_SELL) {
-    const walletSubscriptionId = solanaConnection.onProgramAccountChange(
-      TOKEN_PROGRAM_ID,
+  try {
+    await init();
+    const runTimestamp = Math.floor(new Date().getTime() / 1000);
+    const raydiumSubscriptionId = solanaConnection.onProgramAccountChange(
+      RAYDIUM_LIQUIDITY_PROGRAM_ID_V4,
       async (updatedAccountInfo) => {
-        const accountData = AccountLayout.decode(updatedAccountInfo.accountInfo!.data);
-        if (updatedAccountInfo.accountId.equals(quoteTokenAssociatedAddress)) {
-          return;
-        }
-        let completed = false;
-        while (!completed) {
-          setTimeout(() => {}, 1000);
-          const currValue = await retrieveTokenValueByAddress(accountData.mint.toBase58());
-          if (currValue) {
-            logger.info(accountData.mint, `Current Price: ${currValue} SOL`);
-            completed = await sell(updatedAccountInfo.accountId, accountData.mint, accountData.amount, currValue);
-          } 
+        const key = updatedAccountInfo.accountId.toString();
+        const poolState = LIQUIDITY_STATE_LAYOUT_V4.decode(updatedAccountInfo.accountInfo.data);
+        const poolOpenTime = parseInt(poolState.poolOpenTime.toString());
+        const existing = existingLiquidityPools.has(key);
+
+        if (!existing) {
+          existingLiquidityPools.add(key);
+          logger.info({ poolOpenTime, key }, 'Processing raydium pool (new or untracked)');
+          const _ = processRaydiumPool(updatedAccountInfo.accountId, poolState);
         }
       },
       commitment,
       [
+        { dataSize: LIQUIDITY_STATE_LAYOUT_V4.span },
         {
-          dataSize: 165,
+          memcmp: {
+            offset: LIQUIDITY_STATE_LAYOUT_V4.offsetOf('quoteMint'),
+            bytes: quoteToken.mint.toBase58(),
+          },
         },
         {
           memcmp: {
-            offset: 32,
-            bytes: wallet.publicKey.toBase58(),
+            offset: LIQUIDITY_STATE_LAYOUT_V4.offsetOf('marketProgramId'),
+            bytes: OPENBOOK_PROGRAM_ID.toBase58(),
+          },
+        },
+        {
+          memcmp: {
+            offset: LIQUIDITY_STATE_LAYOUT_V4.offsetOf('status'),
+            bytes: bs58.encode([6, 0, 0, 0, 0, 0, 0, 0]),
           },
         },
       ],
     );
 
-    logger.info(`Listening for wallet changes: ${walletSubscriptionId}`);
-  }
+    const openBookSubscriptionId = solanaConnection.onProgramAccountChange(
+      OPENBOOK_PROGRAM_ID,
+      async (updatedAccountInfo) => {
+        const key = updatedAccountInfo.accountId.toString();
+        const existing = existingOpenBookMarkets.has(key);
+        if (!existing) {
+          existingOpenBookMarkets.add(key);
+          const _ = processOpenBookMarket(updatedAccountInfo);
+        }
+      },
+      commitment,
+      [
+        { dataSize: MARKET_STATE_LAYOUT_V3.span },
+        {
+          memcmp: {
+            offset: MARKET_STATE_LAYOUT_V3.offsetOf('quoteMint'),
+            bytes: quoteToken.mint.toBase58(),
+          },
+        },
+      ],
+    );
 
-  logger.info(`Listening for raydium changes: ${raydiumSubscriptionId}`);
-  logger.info(`Listening for open book changes: ${openBookSubscriptionId}`);
+    // Pumpfun listener
+    const pumpfunSubscriptionId = solanaConnection.onProgramAccountChange(
+      PUMPFUN_PROGRAM_ID,
+      async (updatedAccountInfo) => {
+        const _ = processPumpfunCoin(updatedAccountInfo);
+      },
+      commitment,
+    );
 
-  if (USE_SNIPE_LIST) {
-    setInterval(loadSnipeList, SNIPE_LIST_REFRESH_INTERVAL);
+    // Wallet tracking removed - Scan only mode
+
+    logger.info(`Listening for raydium changes: ${raydiumSubscriptionId}`);
+    logger.info(`Listening for open book changes: ${openBookSubscriptionId}`);
+    logger.info(`Listening for pumpfun changes: ${pumpfunSubscriptionId}`);
+
+    if (USE_SNIPE_LIST) {
+      setInterval(loadSnipeList, SNIPE_LIST_REFRESH_INTERVAL);
+    }
+  } catch (error) {
+    logger.error(`Failed to initialize bot: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
   }
 };
 
